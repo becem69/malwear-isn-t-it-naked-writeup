@@ -1,0 +1,411 @@
+Writeup: malware? isn't it naked? (SPARK CTF, RE, insane)
+==========================================================
+
+Goal: recover the flag that the binary SUS computes at runtime.
+Everything below is derived solely from static analysis of the SUS binary
+and local Python emulation. The binary is never executed.
+
+FLAG: Spark{fr34ky_fr34kish_funky_m4lw4r3_4n4lysis_6699}
+
+
+------------------------------------------------------------
+Step 1. Initial Recon
+------------------------------------------------------------
+
+Command run:
+
+    $ file SUS
+
+Output: ELF 64-bit LSB executable, x86-64, statically linked, stripped.
+
+Note: the original writeup template described the binary as "dynamically
+linked", but the actual SUS binary is statically linked with libc. This
+is confirmed by `readelf -r SUS`, which shows only R_X86_64_IRELATIV
+relocations and no named external symbols. The binary is ~660 KB as a
+result.
+
+Command run:
+
+    $ readelf -S -W SUS
+
+Key sections found:
+
+    .text        vaddr 0x401100  file offset 0x001100  size 0x764bd
+    .rodata      vaddr 0x478000  file offset 0x078000
+    .init_array  vaddr 0x4a0138  file offset 0x0a0138  3 entries
+    .data        vaddr 0x4a40c0  file offset 0x0a40c0
+
+The file offset formula for this binary is:
+    file_offset = vaddr - 0x400000
+
+Because the binary is stripped (no symbol names), interesting functions
+were located by reading .init_array and disassembling around the entry
+point.
+
+Command run:
+
+    $ python3 -c "
+    import struct, sys
+    data = open('SUS','rb').read()
+    for i in range(3):
+        addr = struct.unpack_from('<Q', data, 0x0a0138 + i*8)[0]
+        print(hex(addr))
+    "
+
+Output:
+    init_array[0] = 0x401750   (libc internal constructor)
+    init_array[1] = 0x401785   (key derivation constructor)
+    init_array[2] = 0x401620   (libc internal constructor)
+
+The entry point is 0x401660 (found at .text+0x560). It calls main at
+0x4018db via a hardcoded mov rdi, 0x4018db / call sequence.
+
+Three routines of interest, located by disassembling the above addresses:
+
+    0x401785  constructor, XTEA key derivation
+              (constants 0x1F2E3D4C, 0x0A5C36F1)
+    0x4017f2  XTEA decrypt routine
+              (constant 0xC6EF3720 = DELTA*32, identified at 0x4017fa)
+    0x4018db  main
+
+
+------------------------------------------------------------
+Step 2. Reading main (0x4018db)
+------------------------------------------------------------
+
+Command run:
+
+    $ objdump -d -M intel --start-address 0x4018db \
+              --stop-address 0x4019f4 SUS
+
+What main does, in order:
+
+1. ptrace(PTRACE_TRACEME, 0, 0, 0)
+   Called as: mov edi,0 / mov esi,0 / mov edx,0 / mov ecx,0 / call 0x4113a0
+   If the return value is -1 (already being traced), main returns 1.
+   This is the anti-debug check.
+
+2. malloc(0x618)
+   Called as: mov edi,0x618 / call 0x409440
+   Result pointer stored at [rbp-0x10].
+
+3. Copy 0x610 bytes from vaddr 0x478020 into the malloc buffer.
+   Found by: lea rax,[rip+0x766f3] at 0x401926.
+   0x401926 + 7 + 0x766f3 = 0x478020 (vaddr).
+   File offset: 0x478020 - 0x400000 = 0x78020.
+   The copy is done with a rep movsq loop, not memcpy.
+
+4. Loop: for off in 0..0x610 step 8, call xtea_dec(buf + off)
+   Found by: cmp QWORD PTR [rbp-0x8], 0x60f / jbe loop
+   Each call passes buf+off as a pointer (two in-place dwords).
+
+5. mmap(NULL, 0x1000, PROT_READ|PROT_WRITE|PROT_EXEC, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0)
+   Called with: mov r9d,0 / mov r8d,0xffffffff / mov ecx,0x22 /
+                mov edx,0x7 / mov esi,0x1000 / mov edi,0
+
+6. Copy 0x610 bytes from decrypted buffer into the mmap region.
+   call 0x401030 (memcpy).
+
+7. call rax -- execute the decrypted shellcode.
+
+Summary: the embedded payload is 0x610 (1552) bytes of XTEA-encrypted
+shellcode stored at file offset 0x78020.
+
+
+------------------------------------------------------------
+Step 3. Deriving the XTEA Key (constructor at 0x401785)
+------------------------------------------------------------
+
+Command run:
+
+    $ objdump -d -M intel --start-address 0x401785 \
+              --stop-address 0x4017f2 SUS
+
+Disassembly shows:
+
+    mov DWORD PTR [rbp-0x4], 0x1f2e3d4c   ; a
+    mov DWORD PTR [rbp-0x8], 0x0a5c36f1   ; b
+    mov DWORD PTR [rbp-0xc], 0x0          ; counter
+    loop:
+      rol DWORD PTR [rbp-0x4], 7          ; a = rol32(a, 7)
+      xor DWORD PTR [rbp-0x8], eax        ; b ^= a
+      add DWORD PTR [rbp-0xc], 1
+      cmp DWORD PTR [rbp-0xc], 2
+      jle loop                             ; runs 3 times (0, 1, 2)
+
+After the loop, four key words are computed and stored at 0x4a5ab0..0x4a5abc:
+
+    k[0] = a ^ 0x5A5A5A5A   stored at [rip+0xa42ee] = 0x4a5ab0
+    k[1] = b                 stored at [rip+0xa42e9] = 0x4a5ab4
+    k[2] = a + b             stored at [rip+0xa42df] = 0x4a5ab8
+    k[3] = (b << 9) ^ (a >> 3)  stored at [rip+0xa42cd] = 0x4a5abc
+
+Python derivation:
+
+    a, b = 0x1F2E3D4C, 0x0A5C36F1
+    for _ in range(3):
+        a = ((a << 7) | (a >> 25)) & 0xFFFFFFFF
+        b ^= a
+    k = [
+        a ^ 0x5A5A5A5A,
+        b,
+        (a + b) & 0xFFFFFFFF,
+        ((b << 9) ^ (a >> 3)) & 0xFFFFFFFF
+    ]
+
+Result: k = [0xf3d9bf9d, 0xbb9272f2, 0x651658b9, 0x31d598b8]
+
+
+------------------------------------------------------------
+Step 4. XTEA-Decrypting the Payload
+------------------------------------------------------------
+
+Command run:
+
+    $ objdump -d -M intel --start-address 0x4017f2 \
+              --stop-address 0x401785 SUS
+
+The routine at 0x4017f2 is standard XTEA block decryption:
+32 rounds, DELTA = 0x9E3779B9, starting sum = 0xC6EF3720 (= DELTA * 32).
+
+    s = 0xC6EF3720
+    for 32 rounds:
+        v[1] -= ((((v[0]<<4) ^ (v[0]>>5)) + v[0]) ^ (s + k[(s>>11)&3]))
+        s -= DELTA
+        v[0] -= ((((v[1]<<4) ^ (v[1]>>5)) + v[1]) ^ (s + k[s&3]))
+
+Decrypting all 0x610 bytes from file offset 0x78020 in 8-byte blocks:
+
+    data = open("SUS", "rb").read()
+    payload = data[0x78020:0x78020 + 0x610]
+
+    blob = bytearray()
+    for off in range(0, 0x610, 8):
+        v0, v1 = struct.unpack("<II", payload[off:off+8])
+        v0, v1 = dec(v0, v1)
+        blob += struct.pack("<II", v0, v1)
+
+Verification: the first three bytes of the decrypted blob are 49 89 e7
+(mov r15, rsp), which is the expected prologue of a position-independent
+shellcode. This confirms both the payload location and the key.
+
+The decrypted blob was saved to blob.bin.
+
+
+------------------------------------------------------------
+Step 5. Reversing the VM Shellcode (blob.bin)
+------------------------------------------------------------
+
+Command run:
+
+    $ objdump -D -b binary -m i386:x86-64 -M intel blob.bin
+
+The shellcode is position-independent. It uses a call/pop trick to load
+its own base address into rbp:
+
+    0x00:  49 89 e7        mov r15, rsp    ; save stack for HALT
+    0x03:  e8 00 00 00 00  call 0x8        ; push rip+5
+    0x08:  5d              pop rbp         ; rbp = base of blob
+
+All layout offsets are visible directly in the disassembly as
+[rbp + constant] references:
+
+    0x1d:  lea rsi, [rbp+0x180]        ; BC_OFF  = 0x180  (bytecode start)
+    0x27:  mov ecx, 0x44d              ; BC_LEN  = 0x44d  (1101 bytes)
+    0x49:  lea r12, [rbp+0x140]        ; TAB_OFF = 0x140  (constant table)
+    0x69:  movsxd rax, [rbp+rax*4+0x100] ; JT_OFF = 0x100 (jump table)
+    0x57:  lea r14, [rbp+0x5cd]        ; OUT_OFF = 0x5cd  (output buffer)
+
+Blob layout:
+
+    [0x000, 0x100)   VM code (first 64 bytes are tamper-protected)
+    [0x100, 0x140)   jump table: 16 signed dwords, blob-relative offsets
+    [0x140, 0x180)   obfuscated 64-byte constant table T
+    [0x180, 0x5cd)   encrypted bytecode (BC_LEN = 0x44d bytes)
+    [0x5cd, 0x610)   output buffer (flag written here byte by byte)
+
+--- Tamper protection ---
+
+Before decrypting the bytecode, the shellcode sums the first 64 bytes of
+its own code (blob[0..63]) into an 8-bit value called key1:
+
+    0x0e:  movzx eax, BYTE PTR [rbp+rcx*1+0x0]
+    0x13:  add r9d, eax
+    0x16:  inc ecx
+    0x18:  cmp ecx, 0x40
+    0x1b:  jb  0xe
+
+    key1 = sum(blob[0:64]) & 0xFF   =>  key1 = 0x9
+
+If any byte in that first 64-byte region is patched (e.g., to bypass the
+ptrace check), key1 changes, which corrupts the bytecode decryption and
+the constant table lookups. This makes static patching harder.
+
+--- Bytecode decryption ---
+
+From the disassembly at 0x2c..0x47:
+
+    for i in range(BC_LEN):
+        bc[i] ^= key1 ^ ((0x9E * i) & 0xFF)
+
+--- Bytecode fetch loop ---
+
+From 0x5e..0x76:
+
+    op = (bc[pc] ^ 0xA5) & 0x0F
+    pc += 1
+    offset = jt[op]           ; signed dword from jump table
+    handler = rbp + offset    ; absolute address
+    jmp handler
+
+--- Jump table (read from blob[0x100..0x140]) ---
+
+    idx  handler  blob offset  opcode description
+    0    PUSH      0x78        push next literal byte
+    1    PUSHK     0x81        push decoded constant table entry
+    2    ADD       0xa5        pop two, push a+b
+    3    XOR       0xac        pop two, push a^b
+    4    ROL       0xb3        pop one, rol8 by next byte imm
+    5    MUL       0xbf        pop one, multiply by next byte imm
+    6    AND       0xcc        pop one, AND with next byte imm
+    7    EMIT      0xdb        pop one, write to output buffer
+    8+   HALT      0xe7        restore rsp from r15, ret
+
+--- Handler details (read from blob.bin disassembly) ---
+
+PUSH (0x78):
+    movzx eax, BYTE PTR [rdi]   ; read next bytecode byte
+    inc rdi
+    push rax
+    jmp fetch_loop
+
+PUSHK (0x81):
+    movzx ecx, BYTE PTR [rdi]   ; idx = next byte
+    inc rdi
+    movzx eax, BYTE PTR [r12+rcx]  ; v = T[idx]
+    xor al, (key1 + idx) & 0xFF     ; v ^= (key1+idx)
+    ror al, (key1 + 5*idx) & 7      ; v = ror8(v, ...)
+    push rax
+
+ADD (0xa5):
+    pop rcx; pop rax; add eax,ecx; push rax
+
+XOR (0xac):
+    pop rcx; pop rax; xor eax,ecx; push rax
+
+ROL (0xb3):
+    movzx ecx, BYTE PTR [rdi]; inc rdi
+    pop rax; rol al,cl; push rax
+
+MUL (0xbf):
+    movzx ecx, BYTE PTR [rdi]; inc rdi
+    pop rax; imul eax,ecx; push rax
+
+AND (0xcc):
+    movzx ecx, BYTE PTR [rdi]; inc rdi
+    pop rax; movzx eax,al; and eax,ecx; push rax
+
+EMIT (0xdb):
+    pop rax; mov BYTE PTR [r14],al; inc r14; jmp fetch_loop
+
+HALT (0xe7):
+    mov rsp,r15; ret
+
+The flag is never a static string anywhere in the binary. It is assembled
+one byte at a time by repeated EMIT instructions into the output buffer
+at blob offset 0x5cd.
+
+
+------------------------------------------------------------
+Step 6. Python Emulator (solve.py)
+------------------------------------------------------------
+
+The full solve script is saved at solve.py. It:
+
+1. Reads SUS and extracts the payload at file offset 0x78020.
+2. Derives the XTEA key from the two seed constants.
+3. XTEA-decrypts the payload into blob.bin.
+4. Reads the jump table, constant table, and BC_LEN from fixed offsets.
+5. Computes key1 from blob[0:64].
+6. Decrypts the bytecode with key1 and the rolling 0x9E counter.
+7. Emulates the VM instruction by instruction until HALT.
+8. Prints the output buffer as ASCII.
+
+
+------------------------------------------------------------
+Step 7. Flag
+------------------------------------------------------------
+
+Running solve.py:
+
+    $ python3 solve.py
+    [*] XTEA key: ['0xf3d9bf9d', '0xbb9272f2', '0x651658b9', '0x31d598b8']
+    [*] First bytes of blob: 4989e7e800000000  (expect: 4989e7...)
+    [*] key1 = 0x9
+    [*] Jump table: ['0x78', '0x81', '0xa5', '0xac', '0xb3', '0xbf', '0xcc', '0xdb', '0xe7', ...]
+    [*] HALT at pc=1100, 50 bytes emitted
+    [+] Flag: Spark{fr34ky_fr34kish_funky_m4lw4r3_4n4lysis_6699}
+
+The flag is 50 bytes including the braces.
+
+
+------------------------------------------------------------
+Corrections to the Original Writeup Template
+------------------------------------------------------------
+
+The provided writeup.txt contained several inaccuracies compared to the
+actual SUS binary. The differences found during analysis:
+
+1. Linking type
+   Template said: dynamically linked
+   Reality: statically linked (no external PLT imports, all R_X86_64_IRELATIV)
+   This explains the 660 KB file size.
+
+2. Payload file offset
+   Template said: file offset 0x2020 (vaddr 0x402020)
+   Reality: file offset 0x78020 (vaddr 0x478020)
+   Found by: disassembling main at 0x401926 and resolving
+   lea rax,[rip+0x766f3], which gives 0x401926+7+0x766f3 = 0x478020.
+
+3. Constructor address
+   Template said: 0x401156
+   Reality: 0x401785 (found via .init_array at file offset 0x0a0138)
+
+4. XTEA routine address
+   Template said: 0x4011c3
+   Reality: 0x4017f2 (immediately follows the constructor)
+
+5. Main address
+   Template said: 0x4012ac
+   Reality: 0x4018db (found from entry point at 0x401660 via mov rdi,0x4018db)
+
+6. key1 value
+   Template said: key1 = 9 (correct value but was stated without proof)
+   Reality confirmed: sum(blob[0:64]) & 0xFF = 0x9, verified by running
+   the emulator against the real blob.
+
+Everything else in the template (key derivation constants, XTEA algorithm,
+VM layout offsets, handler logic, bytecode XOR scheme) matches the actual
+binary exactly.
+
+
+------------------------------------------------------------
+Why "insane" Tier
+------------------------------------------------------------
+
+- The flag never appears in plaintext anywhere in the binary or payload.
+- The XTEA key is not stored directly; it is computed at runtime in a
+  constructor that runs before main.
+- The shellcode is position-independent using the call+pop rbp trick,
+  making all internal references relative.
+- key1 is derived from the code bytes themselves, so any patch to the
+  first 64 bytes silently corrupts everything downstream.
+- The constant table is per-entry obfuscated with key1-dependent XOR and
+  rotation, not a flat lookup.
+- The dispatch mechanism uses a jump table of blob-relative dword offsets,
+  which hides the handler structure from a naive linear scan.
+- The flag is assembled one byte at a time by EMIT, so it never exists as
+  a contiguous string in memory until the very end of execution.
+
+Static analysis plus a Python emulator is sufficient. Running the binary,
+defeating ptrace, or using a debugger is not required.
